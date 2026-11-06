@@ -26,7 +26,7 @@ A Streamlit app for university food stalls. Students can order from stalls and t
 
 **1. Clone the repository**
 ```bash
-git clone https://github.com/YOUR-USERNAME/campus-food-tracker.git
+git clone https://github.com/limjiatong/campus-food-tracker.git
 cd campus-food-tracker
 ```
 
