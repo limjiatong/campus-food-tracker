@@ -9,6 +9,8 @@ import hmac
 import os
 import sqlite3
 from datetime import date, datetime, timedelta
+import io
+from PIL import Image, ImageOps
 
 import pandas as pd
 import streamlit as st
@@ -77,6 +79,10 @@ def init_db():
         qty INTEGER NOT NULL
     );
     """)
+    for table in ("vendors", "menu_items"):
+        cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+        if "image" not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN image BLOB")
     conn.commit()
     conn.close()
 
@@ -102,6 +108,22 @@ def money(x):
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+def prepare_image(uploaded_file, max_size=600):
+    """Resize/compress an uploaded image and return JPEG bytes (None if no file)."""
+    if uploaded_file is None:
+        return None
+    img = ImageOps.exif_transpose(Image.open(uploaded_file))
+    if img.mode in ("RGBA", "LA", "P"):
+        img = img.convert("RGBA")
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img, mask=img.split()[-1])
+        img = bg
+    else:
+        img = img.convert("RGB")
+    img.thumbnail((max_size, max_size))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
 
 def order_items_text(order_id):
     items = run("SELECT item_name, qty FROM order_items WHERE order_id=?",
@@ -206,7 +228,7 @@ def auth_page():
 # ================================================================== STUDENT
 def student_browse(student):
     st.header("🏪 Browse stalls")
-    vendors = run("""SELECT v.id, v.shop_name,
+    vendors = run("""SELECT v.id, v.shop_name, v.image,
                      (SELECT COUNT(*) FROM menu_items m
                       WHERE m.vendor_id=v.id AND m.available=1 AND m.deleted=0) AS n_items
                      FROM vendors v ORDER BY v.shop_name""", fetch=True)
@@ -215,7 +237,8 @@ def student_browse(student):
         return
     labels = {f"{v['shop_name']}  ({v['n_items']} items available)": v for v in vendors}
     vendor = labels[st.selectbox("Choose a stall", list(labels))]
-
+    if vendor["image"]:
+        st.image(vendor["image"], width=300)
     items = run("""SELECT * FROM menu_items WHERE vendor_id=? AND available=1 AND deleted=0
                    ORDER BY name""", (vendor["id"],), fetch=True)
     st.subheader(f"{vendor['shop_name']} – Menu")
@@ -227,7 +250,9 @@ def student_browse(student):
     with st.form(f"menu_form_{vendor['id']}_{ver}"):
         qtys = {}
         for it in items:
-            c1, c2, c3 = st.columns([4, 2, 2])
+            ci, c1, c2, c3 = st.columns([1.5, 4, 2, 2])
+            if it["image"]:
+                ci.image(it["image"], width=80)
             c1.markdown(f"**{it['name']}**")
             c2.write(money(it["price"]))
             qtys[it["id"]] = c3.number_input("Qty", 0, 20, 0, key=f"q_{ver}_{it['id']}",
@@ -402,20 +427,42 @@ def vendor_orders(vendor):
 
 def vendor_menu(vendor):
     st.header("🍽️ Manage menu")
+    IMG_TYPES = ["png", "jpg", "jpeg", "webp"]
+
+    # ---- stall photo
+    with st.expander("🖼️ Stall photo"):
+        row = run("SELECT image FROM vendors WHERE id=?", (vendor["id"],), fetch=True, one=True)
+        c1, c2 = st.columns([1, 2])
+        if row and row["image"]:
+            c1.image(row["image"], width=200)
+        else:
+            c1.caption("No photo yet.")
+        up = c2.file_uploader("Upload stall photo", type=IMG_TYPES, key="stall_img")
+        b1, b2 = c2.columns(2)
+        if b1.button("Save stall photo", disabled=up is None):
+            run("UPDATE vendors SET image=? WHERE id=?", (prepare_image(up), vendor["id"]))
+            st.rerun()
+        if row and row["image"] and b2.button("Remove photo"):
+            run("UPDATE vendors SET image=NULL WHERE id=?", (vendor["id"],))
+            st.rerun()
+
+    # ---- add item
     with st.expander("➕ Add a new item", expanded=True):
         with st.form("add_item", clear_on_submit=True):
             c1, c2 = st.columns([3, 1])
             name = c1.text_input("Item name").strip()
             price = c2.number_input(f"Price ({CURRENCY})", 0.0, step=0.5, format="%.2f")
+            photo = st.file_uploader("Item photo (optional)", type=IMG_TYPES)
             if st.form_submit_button("Add item", type="primary"):
                 if not name or price <= 0:
                     st.error("Enter a name and a price above 0.")
                 else:
-                    run("INSERT INTO menu_items(vendor_id, name, price) VALUES (?,?,?)",
-                        (vendor["id"], name, price))
+                    run("INSERT INTO menu_items(vendor_id, name, price, image) VALUES (?,?,?,?)",
+                        (vendor["id"], name, price, prepare_image(photo)))
                     st.success(f"Added {name}.")
                     st.rerun()
 
+    # ---- edit items
     st.subheader("Current menu")
     items = run("SELECT * FROM menu_items WHERE vendor_id=? AND deleted=0 ORDER BY name",
                 (vendor["id"],), fetch=True)
@@ -423,20 +470,36 @@ def vendor_menu(vendor):
         st.info("Your menu is empty. Add your first item above.")
     for it in items:
         with st.container(border=True):
-            c1, c2, c3, c4, c5 = st.columns([3, 1.5, 1.2, 1, 1])
+            img_col, form_col = st.columns([1, 4])
+            if it["image"]:
+                img_col.image(it["image"], width=100)
+            else:
+                img_col.caption("No photo")
+
+            c1, c2, c3, c4, c5 = form_col.columns([3, 1.5, 1.2, 1, 1])
             name = c1.text_input("Name", it["name"], key=f"n_{it['id']}")
             price = c2.number_input("Price", 0.0, value=float(it["price"]), step=0.5,
                                     format="%.2f", key=f"p_{it['id']}")
             avail = c3.checkbox("Available", bool(it["available"]), key=f"a_{it['id']}")
-            if c4.button("Save", key=f"s_{it['id']}"):
+            save = c4.button("Save", key=f"s_{it['id']}")
+            delete = c5.button("Delete", key=f"d_{it['id']}")
+            new_img = form_col.file_uploader("Change photo", type=IMG_TYPES, key=f"img_{it['id']}")
+            rm_img = form_col.checkbox("Remove photo", key=f"rm_{it['id']}") if it["image"] else False
+
+            if save:
                 if name.strip() and price > 0:
                     run("UPDATE menu_items SET name=?, price=?, available=? WHERE id=?",
                         (name.strip(), price, int(avail), it["id"]))
+                    if new_img is not None:
+                        run("UPDATE menu_items SET image=? WHERE id=?",
+                            (prepare_image(new_img), it["id"]))
+                    elif rm_img:
+                        run("UPDATE menu_items SET image=NULL WHERE id=?", (it["id"],))
                     st.toast("Saved ✔")
                     st.rerun()
                 else:
                     st.error("Invalid name or price.")
-            if c5.button("Delete", key=f"d_{it['id']}"):
+            if delete:
                 # soft delete so past orders/reports stay intact
                 run("UPDATE menu_items SET deleted=1 WHERE id=?", (it["id"],))
                 st.rerun()
